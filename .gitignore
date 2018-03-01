@@ -1,7 +1,6 @@
 *.swp
 __pycache__
-.python_history
-.bash_history
+.*
 checkpoints/*
 datasets/*
 logs/*
