@@ -357,7 +357,8 @@ def main():
     # Train model.
 
     logger.info('Begin training')
-    epoch_log = ('[epoch {epoch}] mean training loss: {loss:.3f}, '
+    epoch_log = ('[epoch {epoch}/{total_epoch}] '
+                 'mean training loss: {loss:.3f}, '
                  'validation accuracy: {accuracy:.3f}')
 
     for epoch in range(args.num_epochs):
@@ -367,6 +368,7 @@ def main():
         trainer.save('checkpoints/capsnet/epoch_{epoch}'.format(epoch=epoch+1))
 
         logger.info(epoch_log.format(epoch=epoch+1,
+                                     total_epoch=args.num_epochs,
                                      loss=train_loss,
                                      accuracy=val_accuracy))
 
