@@ -69,7 +69,7 @@ class Trainer:
 
         self.optimizer.step()
 
-        return loss.cpu().data[0]
+        return loss.cpu().data[0] / len(y)
 
     def train_epoch(self, loader, no_progress_bar=False):
         """Train an epoch and step the scheduler.
