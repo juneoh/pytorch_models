@@ -1,62 +1,122 @@
+#!/usr/bin/env python3
 """Define tests for CapsNet.
 """
 from unittest import TestCase
 
-from torch import cuda, Tensor, Size, zeros
+import torch
+from torch import DoubleTensor, Size
 from torch.autograd import Variable
 
-from capsnet import CapsNet, SeparateMarginLoss
+from capsnet import (CapsNet, CapsNetLoss, ReconstructionLoss,
+                     SeparateMarginLoss)
 
-_use_cuda = cuda.is_available()
+BATCH_SIZE = 3
+IN_CHANNELS = 1
+IN_WIDTH = 28
+IN_HEIGHT = 28
+OUT_CAPSULES = 10
+OUT_CHANNELS = 16
 
 
 class TestCapsNet(TestCase):
     """Test CapsNet architecture.
     """
-    def setUp(self):
-        self.capsnet = CapsNet()
-
-        if _use_cuda:
-            self.capsnet = self.capsnet.cuda()
-
-    def test_intermediate_dimensions(self):
-        """Test intermediate layer output dimensions.
+    def test_dimensions(self):
+        """Test dimensions of layer outputs.
         """
-        x = zeros(1, 1, 28, 28)
+        capsnet = CapsNet()
 
-        x = Variable(x.cuda())
+        x = torch.zeros(BATCH_SIZE, IN_CHANNELS, IN_WIDTH, IN_HEIGHT)
+        x = Variable(x)
 
-        x = self.capsnet.conv1(x)
-        self.assertEquals(x.size()[1:], Size([256, 20, 20]))
+        x = capsnet.conv1(x)
+        self.assertEquals(x.size(), Size([BATCH_SIZE, 256, 20, 20]))
 
-        x = self.capsnet.primary_capsules(x)
-        self.assertEquals(x.size()[1:], Size([32, 8, 6, 6]))
+        x = capsnet.primary_capsules(x)
+        self.assertEquals(x.size(), Size([BATCH_SIZE, 32, 8, 6, 6]))
 
-        x = self.capsnet.digit_capsules(x)
-        self.assertEquals(x.size()[1:], Size([10, 16]))
+        x = capsnet.digit_capsules(x)
+        self.assertEquals(x.size(), Size([BATCH_SIZE,
+                                          OUT_CAPSULES,
+                                          OUT_CHANNELS]))
 
-    def test_result_output_dimensions(self):
-        """Test network output dimensions.
+    def test_forward_backward(self):
+        """Test for forward and backward.
         """
-        x = zeros(1, 1, 28, 28)
+        for use_cuda in (False, True):
+            capsnet = CapsNet()
+            criterion = CapsNetLoss()
 
-        x = Variable(x.cuda())
+            x = torch.zeros(BATCH_SIZE, IN_CHANNELS, IN_WIDTH, IN_HEIGHT)
+            x = Variable(x, requires_grad=True)
+            y = torch.zeros(BATCH_SIZE)
+            y = Variable(y)
 
-        x = self.capsnet(x)
-        self.assertEquals(x.size()[1:], Size([10]))
+            if use_cuda:
+                capsnet = capsnet.cuda()
+                criterion = criterion.cuda()
+                x = x.cuda()
+                y = y.cuda()
+
+            output = capsnet(x)
+            loss = criterion(output, y)
+
+            loss.backward()
 
 
 class TestSeparableMarginLoss(TestCase):
     """Test SeparableMarginLoss.
     """
     def test_calculations(self):
+        """Test loss calculation.
+
+        torch.DoubleTensor is used instead of torch.Tensor, which is
+        torch.FloatTensor by default, to match the precision with Python's
+        float type.
+        """
         separable_margin_loss = SeparateMarginLoss()
 
-        x = Tensor(1, 10).fill_(0)
+        x = torch.zeros(2, 10).type(DoubleTensor)
         x[0, 0] = 1
+        x[1, 0] = 1
 
-        loss = Tensor(1, 10).fill_(0.5 * 0.9 ** 2)
-        loss[0, 0] = 0.1
+        y = DoubleTensor([0, 1])
 
-        print(separable_margin_loss(x, x), loss)
-        self.assertTrue(separable_margin_loss(x, x).equal(loss))
+        loss = separable_margin_loss(Variable(x), Variable(y))
+
+        self.assertEquals(loss.data[0], 0)
+        self.assertEquals(loss.data[1], ((0.5 * 0.9 ** 2) + (0.9 ** 2)))
+
+
+class TestReconstructionLoss(TestCase):
+    """Test ReconstructionLoss.
+    """
+    def test_dimensions(self):
+        """Test dimensions of output.
+        """
+        reconstruction_loss = ReconstructionLoss(
+            in_capsules=OUT_CAPSULES,
+            in_channels=OUT_CHANNELS,
+            out_channels=IN_CHANNELS * IN_WIDTH * IN_HEIGHT)
+
+        x = torch.zeros(BATCH_SIZE, OUT_CAPSULES, OUT_CHANNELS)
+        y = torch.zeros(BATCH_SIZE, IN_CHANNELS * IN_WIDTH * IN_HEIGHT)
+        loss = reconstruction_loss(Variable(x), Variable(y))
+
+        self.assertEquals(loss.size(), Size([1]))
+
+
+class TestCapsNetLoss(TestCase):
+    """Test CapsNetLoss.
+    """
+    def test_dimensions(self):
+        """Test dimensions of output.
+        """
+        x = torch.zeros(BATCH_SIZE, IN_CHANNELS, IN_WIDTH, IN_HEIGHT)
+        output = torch.zeros(BATCH_SIZE, OUT_CAPSULES, OUT_CHANNELS)
+        y = torch.zeros(BATCH_SIZE)
+
+        capsnet_loss = CapsNetLoss()
+        loss = capsnet_loss((Variable(x), Variable(output)), Variable(y))
+
+        self.assertEquals(loss.size(), Size([1]))
