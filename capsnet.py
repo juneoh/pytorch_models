@@ -2,7 +2,6 @@
 """Implement and train CapsNet architecture for MNIST dataset.
 """
 import os
-import pdb
 import sys
 
 import torch
@@ -18,163 +17,388 @@ from torchvision.transforms import Compose, Normalize, ToTensor
 
 from utils import get_loaders, get_logger, get_parser, Trainer
 
+# DocTest parameters.
+BATCH_SIZE = 3
+IN_CAPSULES = 32
+IN_CHANNELS = 8
+OUT_CAPSULES = 10
+OUT_CHANNELS = 16
+NUM_ROUTING = 3
+HEIGHT = 20
+WIDTH = 20
 
-def is_nan(x):
-    x = x.sum().data[0]
-    return True if x != x else False
 
+class DynamicRouting(Module):
+    """Provide dynamic routing operation.
 
-class Capsules(Module):
-    """Provide base capsule operation.
+    Args:
+        in_capsules (int): The number of capsules of the input.
+        in_channels (int): The number of channels of the input.
+        out_capsules (int): The number of capsules of the output.
+        out_channels (int): The number of channels of the output.
+        num_routing (int): The number of routing logit update iterations.
     """
-    def squash(self, s_j):
-        """Introduce non-linearity through squashing.
+    def __init__(self, in_capsules, in_channels, out_capsules, out_channels,
+                 num_routing):
+        super(DynamicRouting, self).__init__()
 
-        Args:
-            s_j: The input vector.
-
-        Returns:
-            The output vector of the same size.
-        """
-        s_j_norm = s_j.view(s_j.size()[0], -1).norm(p=1, dim=1)
-        s_j_norm = s_j_norm.view(-1, *((1,) * (s_j.dim() - 1)))
-        s_j_norm_sq = s_j_norm ** 2
-
-        return ((s_j_norm_sq / (1 + s_j_norm_sq)) * (s_j / (s_j_norm + 1e-7)))
-
-
-class PrimaryCapsules(Capsules):
-    """Perform a convolutional capsule operation.
-    """
-    def __init__(self, in_channels=256, out_channels=8, out_capsules=32,
-                 **kwargs):
-        super(PrimaryCapsules, self).__init__()
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.out_capsules = out_capsules
-
-        self.capsules = Conv2d(in_channels=in_channels,
-                               out_channels=out_channels * out_capsules,
-                               **kwargs)
-        self.relu = ReLU(inplace=True)
-
-    def forward(self, x):
-        x = self.capsules(x)
-        x = self.relu(x)
-        x = self.squash(x)
-
-        return x.view(-1, self.out_capsules, self.out_channels, *x.size()[2:])
-
-
-class DigitCapsules(Capsules):
-    """Perform a fully-connected capsule operation.
-    """
-    def __init__(self, in_capsules=32, in_channels=8, out_capsules=10,
-                 out_channels=16, num_routing=3):
-        super(DigitCapsules, self).__init__()
         self.in_capsules = in_capsules
         self.in_channels = in_channels
         self.out_capsules = out_capsules
         self.out_channels = out_channels
         self.num_routing = num_routing
 
-        self.register_parameter('W', None)
+        self.register_parameter('bias', None)
 
-    def _mul_1(self, u, W):
-        """Multiply tensors of different sizes, namely u and W.
+    def _initialize_bias(self, u_hat):
+        bias = type(u_hat.data)(self.out_capsules, self.out_channels, 1, 1)
+        bias.fill_(0.1)
+        self.bias = Parameter(bias)
 
-        Args:
-            u: The output of the previous capsule, of size [batch_size,
-            in_capsules, in_channels, width, height].
-            W: The weight matrix, of size [in_capsules, in_channels, width,
-            height, out_capsules, out_channels].
-
-        Returns:
-            The prediction vectors, of size [batch_size, in_capsules,
-            (in_channels * width * height), out_capsules, out_channels]
-        """
-        width, height = W.size()[2:4]
-
-        u = u.view(*u.size(), 1, 1)
-        u = u.expand(*u.size()[:-2], *W.size()[-2:])
-        W = W.view(1, *W.size())
-        W = W.expand_as(u)
-
-        u_hat = u * W
-        u_hat = u_hat.view(-1,
-                           self.in_capsules,
-                           (self.in_channels * width * height),
-                           self.out_capsules, self.out_channels)
-
-        return u_hat
-
-    def _mul_2(self, c_ij, u_hat):
-        """Multiply tensors of different sizes, namely c_ij and u_hat.
+    def squash(self, s_j):
+        """Introduce non-linearity through squashing.
 
         Args:
-            c_ij: The coupling coefficients, of size [in_capsules,
-            out_capsules].
-            u_hat: The prediction vectors, of size [batch_size, in_capsules,
-            (in_channels * width * height), out_capsules, out_channels].
+            s_j (torch.Tensor): The total output of the layer, of any size.
 
         Returns:
-            The total input for the capsule, of size [batch_size, out_capsules,
-            out_channels]
+            (torch.Tensor): The squashed output vector, of the same size.
         """
-        c_ij = c_ij.view(1, self.in_capsules, self.out_capsules, 1)
-        u_hat = u_hat.sum(2)
+        # Reshape.
+        batch_size, *_ = s_j.size()
+        s_j_norm = s_j.view(batch_size, -1)
 
-        return (c_ij.expand_as(u_hat) * u_hat).sum(dim=1)
+        # Calculate.
+        s_j_norm = s_j_norm.norm(p=1, dim=1)
+        while s_j_norm.dim() < s_j.dim():
+            s_j_norm = s_j_norm.view(*s_j_norm.size(), 1)
+        s_j_norm_sq = s_j_norm ** 2
+        v_j = ((s_j_norm_sq / (1 + s_j_norm_sq)) * (s_j / (s_j_norm + 1e-7)))
 
-    def _dot(self, u_hat, v_j):
-        """Measure the agreement between the current output of each capsule in
-        the layer above, and the prediction made by each capsules in the layer
-        below.
+        return v_j
+
+    def mul(self, c_ij, u_hat):
+        """Multiply the coupling coefficients to the prediction vectors.
 
         Args:
-            u_hat: The prediction vectors, of size [batch_size, in_capsules,
-            (in_channels * width * height), out_capsules, out_channels].
-            v_j: The current output of the each capsule in the layer above, of
-            size [batch_size, out_capsules, out_channels].
+            c_ij (torch.Tensor): The coupling coefficients.
+            u_hat (torch.Tensor): The prediction vectors.
 
         Returns:
-            The agreement vector, of size [in_capsules, out_capsules].
+            (torch.Tensor): The total output of the layer.
+
+        Example::
+            >>> routing = DynamicRouting(IN_CAPSULES, IN_CHANNELS,
+            ...                          OUT_CAPSULES, OUT_CHANNELS,
+            ...                          NUM_ROUTING)
+            >>> c_ij = torch.Tensor(IN_CAPSULES, OUT_CAPSULES)
+            >>> c_ij = Variable(c_ij)
+            >>> u_hat = torch.Tensor(BATCH_SIZE,
+            ...                      IN_CAPSULES, IN_CHANNELS,
+            ...                      OUT_CAPSULES, OUT_CHANNELS,
+            ...                      HEIGHT, WIDTH)
+            >>> u_hat = Variable(u_hat)
+            >>> s_j = torch.Tensor(BATCH_SIZE,
+            ...                    OUT_CAPSULES, OUT_CHANNELS,
+            ...                    HEIGHT, WIDTH)
+            >>> routing.mul(c_ij, u_hat).size() == s_j.size()
+            True
         """
-        u_hat = u_hat.sum(dim=4)
-        u_hat = u_hat.sum(dim=2)
-        u_hat = u_hat.sum(dim=0)
+        if self.bias is None:
+            self._initialize_bias(u_hat)
 
-        v_j = v_j.sum(dim=2)
-        v_j = v_j.sum(dim=0, keepdim=True)
+        batch_size, *_, height, width = u_hat.size()
 
-        return u_hat * v_j
+        # Reshape.
+        c_ij = c_ij.view(1, self.in_capsules, 1, self.out_capsules, 1, 1, 1)
+        c_ij = c_ij.expand_as(u_hat)
 
-    def forward(self, u):
-        use_cuda = u.is_cuda
+        # Calculate.
+        s_j = c_ij * u_hat
 
-        width, height = u.size()[3:5]
+        # Reshape.
+        s_j = s_j.view(batch_size,
+                       (self.in_capsules * self.in_channels),
+                       self.out_capsules, self.out_channels,
+                       height, width)
+        s_j = s_j.sum(dim=1)
+        s_j += self.bias
 
-        if self.W is None:
-            W = Tensor(self.in_capsules, self.in_channels, width, height,
-                       self.out_capsules, self.out_channels).normal_(std=0.1)
-            if use_cuda:
-                W = W.cuda()
-            self.W = Parameter(W)
+        return s_j
 
-        u_hat = self._mul_1(u, self.W)
+    def dot(self, u_hat, v_j):
+        """Calculate inter-layer agreement.
 
-        b_ij = torch.zeros(self.in_capsules, self.out_capsules)
-        if use_cuda:
-            b_ij = b_ij.cuda()
+        Args:
+            u_hat (torch.Tensor): The prediction vectors.
+            v_j (torch.Tensor): The current output of the each capsule in the
+                layer.
+
+        Returns:
+            (torch.Tensor): The agreement vector.
+
+        Example::
+            >>> routing = DynamicRouting(IN_CAPSULES, IN_CHANNELS,
+            ...                          OUT_CAPSULES, OUT_CHANNELS,
+            ...                          NUM_ROUTING)
+            >>> u_hat = torch.Tensor(BATCH_SIZE,
+            ...                      IN_CAPSULES, IN_CHANNELS,
+            ...                      OUT_CAPSULES, OUT_CHANNELS,
+            ...                      HEIGHT, WIDTH)
+            >>> v_j = torch.Tensor(BATCH_SIZE,
+            ...                    OUT_CAPSULES, OUT_CHANNELS,
+            ...                    HEIGHT, WIDTH)
+            >>> agreement = torch.Tensor(IN_CAPSULES, OUT_CAPSULES)
+            >>> routing.dot(u_hat, v_j).size() == agreement.size()
+            True
+        """
+        batch_size, *_, height, width = u_hat.size()
+
+        # Reshape.
+        v_j = v_j.view(batch_size,
+                       1, 1,
+                       self.out_capsules, self.out_channels,
+                       height, width)
+        v_j = v_j.expand_as(u_hat)
+
+        # Calculate.
+        agreement = u_hat * v_j
+
+        # Reshape.
+        agreement = agreement.view(batch_size,
+                                   self.in_capsules, self.in_channels,
+                                   self.out_capsules, self.out_channels,
+                                   (height * width))
+        agreement = agreement.sum(dim=5)
+        agreement = agreement.sum(dim=4)
+        agreement = agreement.sum(dim=2)
+        agreement = agreement.sum(dim=0)
+
+        return agreement
+
+    def forward(self, u_hat):
+        """Perform dynamic routing and update logits.
+
+        Args:
+            u_hat (torch.Tensor): The prediction vector.
+
+        Returns:
+            (torch.Tensor): The current output of the each capsule in the
+                layer.
+
+        Example::
+            >>> routing = DynamicRouting(IN_CAPSULES, IN_CHANNELS,
+            ...                          OUT_CAPSULES, OUT_CHANNELS,
+            ...                          NUM_ROUTING)
+            >>> u_hat = torch.Tensor(BATCH_SIZE,
+            ...                      IN_CAPSULES, IN_CHANNELS,
+            ...                      OUT_CAPSULES, OUT_CHANNELS,
+            ...                      HEIGHT, WIDTH)
+            >>> output = torch.Tensor(BATCH_SIZE,
+            ...                       OUT_CAPSULES, OUT_CHANNELS,
+            ...                       HEIGHT, WIDTH)
+            >>> routing.forward(Variable(u_hat)).size() == output.size()
+            True
+        """
+        b_ij = type(u_hat.data)(self.in_capsules, self.out_capsules).fill_(0)
 
         for _ in range(self.num_routing):
             c_ij = softmax(Variable(b_ij), dim=1)
-            s_j = self._mul_2(c_ij, u_hat)
+            s_j = self.mul(c_ij, u_hat)
             v_j = self.squash(s_j)
-            b_ij += self._dot(u_hat, v_j).data
-            if is_nan(c_ij) or is_nan(s_j) or is_nan(v_j):
-                pdb.set_trace()
+            b_ij += self.dot(u_hat, v_j).data
+
+        return v_j
+
+
+class PrimaryCapsules(Module):
+    """Perform a convolutional capsule operation.
+
+    Args:
+        in_capsules (int): The number of capsules of the input.
+        in_channels (int): The number of channels of the input.
+        out_capsules (int): The number of capsules of the output.
+        out_channels (int): The number of channels of the output.
+        num_routing (int): The number of routing logit update iterations.
+    """
+    def __init__(self, in_capsules, in_channels, out_capsules, out_channels,
+                 num_routing):
+        super(PrimaryCapsules, self).__init__()
+
+        self.in_capsules = in_capsules
+        self.in_channels = in_channels
+        self.out_capsules = out_capsules
+        self.out_channels = out_channels
+        self.num_routing = num_routing
+
+        self.conv = Conv2d(
+            in_channels=(self.in_capsules * self.in_channels),
+            out_channels=(self.out_capsules * self.out_channels),
+            kernel_size=(9, 9),
+            stride=(2, 2),
+            bias=False)
+        self.routing = DynamicRouting(
+            in_capsules=1, in_channels=1,
+            out_capsules=out_capsules, out_channels=out_channels,
+            num_routing=num_routing)
+
+    def forward(self, x):
+        """Apply convolution and perform routing.
+
+        Args:
+            x (torch.Tensor): The output of the previous layer.
+            (torch.Tensor): The output of the current layer.
+
+        Example::
+            >>> primary_capsules = PrimaryCapsules(IN_CAPSULES, IN_CHANNELS,
+            ...                                    OUT_CAPSULES, OUT_CHANNELS,
+            ...                                    NUM_ROUTING)
+            >>> x = torch.Tensor(BATCH_SIZE,
+            ...                  IN_CAPSULES, IN_CHANNELS,
+            ...                  20, 20)
+            >>> x = Variable(x)
+            >>> output = torch.Tensor(BATCH_SIZE, OUT_CAPSULES, OUT_CHANNELS,
+            ...                       6, 6)
+            >>> primary_capsules.forward(x).size() == output.size()
+            True
+        """
+        # Reshape.
+        batch_size, *_, height, width = x.size()
+        x = x.view(batch_size,
+                   (self.in_capsules * self.in_channels),
+                   height, width)
+
+        # Calculate.
+        x = self.conv(x)
+
+        # Reshape.
+        batch_size, *_, height, width = x.size()
+        x = x.view(batch_size,
+                   1, 1,
+                   self.out_capsules, self.out_channels,
+                   height, width)
+
+        # Calculate.
+        x = self.routing(x)
+
+        return x
+
+
+class DigitCapsules(Module):
+    """Perform a fully-connected capsule operation.
+
+    Args:
+        in_capsules (int): The number of capsules of the input.
+        in_channels (int): The number of channels of the input.
+        out_capsules (int): The number of capsules of the output.
+        out_channels (int): The number of channels of the output.
+        num_routing (int): The number of routing logit update iterations.
+    """
+    def __init__(self, in_capsules, in_channels, out_capsules, out_channels,
+                 num_routing):
+        super(DigitCapsules, self).__init__()
+
+        self.in_capsules = in_capsules
+        self.in_channels = in_channels
+        self.out_capsules = out_capsules
+        self.out_channels = out_channels
+        self.num_routing = num_routing
+
+        self.routing = DynamicRouting(
+            in_capsules=in_capsules, in_channels=in_channels,
+            out_capsules=out_capsules, out_channels=out_channels,
+            num_routing=num_routing)
+
+        self.register_parameter('W', None)
+
+    def _initialize_weights(self, u):
+        *_, height, width = u.size()
+        W = type(u.data)(self.in_capsules, self.in_channels,
+                         self.out_capsules, self.out_channels,
+                         height, width)
+        W.normal_(std=0.1)
+        self.W = Parameter(W)
+
+    def mul(self, u, W):
+        """Multiply previous layer output by the weight matrix.
+
+        Args:
+            u (torch.Tensor): The output of the previous layer.
+            W (torch.Tensor): The weight matrix.
+
+        Returns:
+            (torch.Tensor): The prediction vectors.
+
+        Example::
+            >>> digit_capsules = DigitCapsules(IN_CAPSULES, IN_CHANNELS,
+            ...                                OUT_CAPSULES, OUT_CHANNELS,
+            ...                                NUM_ROUTING)
+            >>> u = torch.Tensor(BATCH_SIZE,
+            ...                  IN_CAPSULES, IN_CHANNELS,
+            ...                  HEIGHT, WIDTH)
+            >>> W = torch.Tensor(IN_CAPSULES, IN_CHANNELS,
+            ...                  OUT_CAPSULES, OUT_CHANNELS,
+            ...                  HEIGHT, WIDTH)
+            >>> u_hat = torch.Tensor(BATCH_SIZE,
+            ...                      IN_CAPSULES, IN_CHANNELS,
+            ...                      OUT_CAPSULES, OUT_CHANNELS,
+            ...                      HEIGHT, WIDTH)
+            >>> digit_capsules.mul(u, W).size() == u_hat.size()
+            True
+        """
+        # Reshape.
+        batch_size, *_, height, width = u.size()
+        u = u.view(batch_size,
+                   self.in_capsules, self.in_channels,
+                   1, 1,
+                   height, width)
+        u = u.expand(batch_size,
+                     self.in_capsules, self.in_channels,
+                     self.out_capsules, self.out_channels,
+                     height, width)
+        W = W.view(1, *W.size())
+        W = W.expand_as(u)
+
+        # Calculate.
+        u_hat = u * W
+
+        return u_hat
+
+    def forward(self, u):
+        """Apply weight and perform routing.
+
+        Args:
+            u (torch.Tensor): The output of the previous layer.
+
+        Returns:
+            (torch.Tensor): The output of the current layer.
+
+        Example::
+            >>> digit_capsules = DigitCapsules(IN_CAPSULES, IN_CHANNELS,
+            ...                                OUT_CAPSULES, OUT_CHANNELS,
+            ...                                NUM_ROUTING)
+            >>> u = torch.Tensor(BATCH_SIZE,
+            ...                  IN_CAPSULES, IN_CHANNELS,
+            ...                  HEIGHT, WIDTH)
+            >>> u = Variable(u)
+            >>> output = torch.Tensor(BATCH_SIZE,
+            ...                       OUT_CAPSULES, OUT_CHANNELS)
+            >>> digit_capsules.forward(u).size() == output.size()
+            True
+        """
+        if self.W is None:
+            self._initialize_weights(u)
+
+        # Calculate.
+        u_hat = self.mul(u, self.W)
+        v_j = self.routing(u_hat)
+
+        # Reshape.
+        batch_size, *_, height, width = u_hat.size()
+        v_j = v_j.view(batch_size,
+                       self.out_capsules, self.out_channels,
+                       (height * width))
+        v_j = v_j.sum(dim=-1)
 
         return v_j
 
@@ -185,19 +409,53 @@ class CapsNet(Module):
     On forward pass, this model outputs a tuple of the input data and the
     the output of digit capsules.
     """
-    def __init__(self):
+    def __init__(self, in_channels=1, out_capsules=10, out_channels=16):
         super(CapsNet, self).__init__()
 
-        self.conv1 = Sequential(Conv2d(in_channels=1,
-                                       out_channels=256,
-                                       kernel_size=(9, 9),
-                                       stride=1),
-                                ReLU(inplace=True))
-        self.primary_capsules = PrimaryCapsules(kernel_size=(9, 9), stride=2)
-        self.digit_capsules = DigitCapsules()
+        self.bias = Parameter(Tensor(256, 1, 1).fill_(0.1))
+
+        self.conv = Conv2d(in_channels=in_channels,
+                           out_channels=256,
+                           kernel_size=(9, 9),
+                           stride=1,
+                           bias=False)
+        self.relu = ReLU(inplace=True)
+
+        self.primary_capsules = PrimaryCapsules(in_capsules=1,
+                                                in_channels=256,
+                                                out_capsules=32,
+                                                out_channels=8,
+                                                num_routing=1)
+        self.digit_capsules = DigitCapsules(in_capsules=32,
+                                            in_channels=8,
+                                            out_capsules=out_capsules,
+                                            out_channels=out_channels,
+                                            num_routing=3)
 
     def forward(self, x):
-        y = self.conv1(x)
+        """Compute class vectors.
+
+        Args:
+            x (torch.Tensor): The input image.
+
+        Returns:
+            (torch.Tensor): The class vectors.
+
+        Example:
+            >>> capsnet = CapsNet()
+            >>> x = torch.Tensor(BATCH_SIZE, 1, 28, 28)
+            >>> x = Variable(x)
+            >>> y = torch.Tensor(BATCH_SIZE, 10, 16)
+            >>> output = capsnet.forward(x)
+            >>> output[0] is x
+            True
+            >>> output[1].size() == y.size()
+            True
+        """
+        y = self.conv(x)
+        y = y + self.bias
+        y = self.relu(y)
+
         y = self.primary_capsules(y)
         y = self.digit_capsules(y)
 
