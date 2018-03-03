@@ -21,47 +21,21 @@ OUT_CHANNELS = 16
 class TestCapsNet(TestCase):
     """Test CapsNet architecture.
     """
-    def test_dimensions(self):
-        """Test dimensions of layer outputs.
-        """
-        capsnet = CapsNet()
-
-        x = torch.zeros(BATCH_SIZE, IN_CHANNELS, IN_WIDTH, IN_HEIGHT)
-        x = Variable(x)
-
-        x = capsnet.conv1(x)
-        self.assertEquals(x.size(), Size([BATCH_SIZE, 256, 20, 20]))
-
-        x = capsnet.primary_capsules(x)
-        self.assertEquals(x.size(), Size([BATCH_SIZE, 32, 8, 6, 6]))
-
-        x = capsnet.digit_capsules(x)
-        self.assertEquals(x.size(), Size([BATCH_SIZE,
-                                          OUT_CAPSULES,
-                                          OUT_CHANNELS]))
-
     def test_forward_backward(self):
         """Test for forward and backward.
         """
-        for use_cuda in (False, True):
-            capsnet = CapsNet()
-            criterion = CapsNetLoss()
+        capsnet = CapsNet()
+        criterion = CapsNetLoss()
 
-            x = torch.zeros(BATCH_SIZE, IN_CHANNELS, IN_WIDTH, IN_HEIGHT)
-            x = Variable(x, requires_grad=True)
-            y = torch.zeros(BATCH_SIZE)
-            y = Variable(y)
+        x = torch.zeros(BATCH_SIZE, IN_CHANNELS, IN_WIDTH, IN_HEIGHT)
+        x = Variable(x, requires_grad=True)
+        y = torch.zeros(BATCH_SIZE)
+        y = Variable(y)
 
-            if use_cuda:
-                capsnet = capsnet.cuda()
-                criterion = criterion.cuda()
-                x = x.cuda()
-                y = y.cuda()
+        output = capsnet(x)
+        loss = criterion(output, y)
 
-            output = capsnet(x)
-            loss = criterion(output, y)
-
-            loss.backward()
+        loss.backward()
 
 
 class TestSeparableMarginLoss(TestCase):
